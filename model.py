@@ -9,7 +9,10 @@ from scipy.linalg import lu
 class Invertible1x1(nn.Module):
     def __init__(self, dim, lu_decomposed=True):
         super().__init__()
-        w = special_ortho_group.rvs(dim)
+        # w = special_ortho_group.rvs(dim)
+        # print(w)
+        w = np.array([[-0.47315506, 0.88097916],
+                      [-0.88097916, -0.47315506]])
         if lu_decomposed:
             p, l, u = lu(w)
             self.p = torch.from_numpy(p).float().cuda()
@@ -18,10 +21,16 @@ class Invertible1x1(nn.Module):
         else:
             self.w = nn.Parameter(torch.from_numpy(w).float().cuda())
         self.lu_decomposed = lu_decomposed
+    
+    @staticmethod
+    def compose_w(p, l, u):
+        l = torch.tril(l)
+        u = torch.triu(u)
+        return torch.mm(torch.mm(p, l), u)
   
     def forward(self, x):
         if self.lu_decomposed:
-            w = torch.mm(torch.mm(self.p, self.l), self.u)
+            w = self.compose_w(self.p, self.l, self.u)
         else:
             w = self.w
         y = torch.mm(x, w)
@@ -29,7 +38,7 @@ class Invertible1x1(nn.Module):
     
     def invert(self, y):
         if self.lu_decomposed:
-            w = torch.mm(torch.mm(self.p, self.l), self.u)
+            w = self.compose_w(self.p, self.l, self.u)
             log_det = torch.sum(torch.log(
                 torch.abs(torch.diagonal(self.u))))
         else:
@@ -40,15 +49,13 @@ class Invertible1x1(nn.Module):
         return x, log_det.expand(x.shape[0])
 
 class AffineCouple(nn.Module):
-    def __init__(self, dim, flip):
+    def __init__(self, dim, flip, n_features=256, n_layers=3, activation=nn.ReLU):
         super().__init__()
-        self.shift_log_scale_fn = nn.Sequential(
-                nn.Linear(dim//2, 256),
-                nn.ReLU(),
-                nn.Linear(256, 256),
-                nn.ReLU(),
-                nn.Linear(256, dim),
-            ).cuda()
+        assert n_layers >= 2
+        layers = [nn.Linear(dim//2, n_features), activation(),] + \
+            [nn.Linear(n_features, n_features), activation(),] * (n_layers-2) + \
+            [nn.Linear(n_features, dim)]
+        self.shift_log_scale_fn = nn.Sequential(*layers).cuda()
         self.dim = dim
         self.flip = flip
     
@@ -79,10 +86,10 @@ class AffineCouple(nn.Module):
         if self.flip:
             y1, x2 = x2, y1
         x = torch.cat([y1, x2], -1)
-        log_det = log_scale
+        log_det = log_scale.sum(-1)
         return x, log_det
 
-class NF(nn.Sequential):
+class NFSequential(nn.Sequential):
     @staticmethod
     def base_log_prob_fn(x):
         return torch.sum(- (x ** 2) / 2 - np.log(np.sqrt(2 * np.pi)), -1)
@@ -95,7 +102,7 @@ class NF(nn.Sequential):
         
     def sample_nvp_chain(self, N, dim):
         x = self.base_sample_fn(N, dim)
-        return self.forward(x)
+        return self(x)
     
     def invert(self, y):
         for module in reversed(self):
@@ -109,5 +116,5 @@ class NF(nn.Sequential):
         for module in reversed(self):
             y, logscale = module.invert(y=y)
             # One logscale per element in a batch per layer of flow.
-            logscales += logscale.squeeze(-1)
+            logscales += logscale
         return self.base_log_prob_fn(y) - logscales
